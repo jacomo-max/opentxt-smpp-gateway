@@ -1,0 +1,17 @@
+{
+  "name": "opentxt-smpp-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SMPP 3.4 gateway that bridges customer ESME binds to the OpenTxt HTTP API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "smpp": "^0.6.0-rc.4"
+  }
+}

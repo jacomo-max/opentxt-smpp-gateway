@@ -10,7 +10,10 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-// systemId -> { session, account, limiter, inFlight }
+// systemId -> { account, limiter, inFlight, sessions: Set<session> }
+// One ESME may hold several sessions at once (e.g. a transmitter for submits
+// plus a separate receiver worker for delivery receipts), so we keep every
+// live session per system_id instead of a single slot.
 const binds = new Map();
 // opentxt message id -> { systemId, smppMessageId, to, from }
 const messageIndex = new Map();
@@ -29,6 +32,27 @@ setInterval(() => {
 // and keep the mapping to the OpenTxt UUID in memory.
 function shortId() {
   return crypto.randomBytes(8).toString('hex').toUpperCase();
+}
+
+function getState(systemId, account) {
+  let state = binds.get(systemId);
+  if (!state) {
+    state = {
+      account,
+      limiter: new RateLimiter(account.tps),
+      inFlight: 0,
+      sessions: new Set(),
+    };
+    binds.set(systemId, state);
+  }
+  return state;
+}
+
+/** Sessions that are allowed to receive deliver_sm (rx + trx binds). */
+function receiveSessions(systemId) {
+  const state = binds.get(systemId);
+  if (!state) return [];
+  return [...state.sessions].filter((s) => s.otxtCanReceive);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +88,12 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
   session.on('error', (err) => log('[smpp] session error', err?.message));
 
   session.on('close', () => {
-    if (bound && binds.get(bound.systemId)?.session === session) {
-      binds.delete(bound.systemId);
-      log(`[smpp] ${bound.systemId} unbound`);
-    }
+    if (!bound) return;
+    const state = binds.get(bound.systemId);
+    if (!state) return;
+    state.sessions.delete(session);
+    log(`[smpp] ${bound.systemId} session closed (${state.sessions.size} left)`);
+    if (state.sessions.size === 0) binds.delete(bound.systemId);
   });
 
   function handleBind(pdu, mode) {
@@ -78,13 +104,12 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       return session.send(pdu.response({ command_status: smpp.ESME_RBINDFAIL }));
     }
     bound = account;
-    binds.set(systemId, {
-      session,
-      account,
-      limiter: new RateLimiter(account.tps),
-      inFlight: 0,
-    });
-    log(`[smpp] ${systemId} bound (${mode}) @ ${account.tps} tps`);
+    session.otxtMode = mode;
+    session.otxtCanReceive = mode !== 'tx'; // rx + trx get deliver_sm
+    session.otxtCanSubmit = mode !== 'rx'; // tx + trx may submit
+    const state = getState(systemId, account);
+    state.sessions.add(session);
+    log(`[smpp] ${systemId} bound (${mode}) @ ${account.tps} tps — ${state.sessions.size} session(s)`);
     session.send(pdu.response({ system_id: 'opentxt' }));
   }
 
@@ -99,7 +124,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
   });
 
   session.on('submit_sm', async (pdu) => {
-    if (!bound) {
+    if (!bound || !session.otxtCanSubmit) {
       return session.send(pdu.response({ command_status: smpp.ESME_RINVBNDSTS }));
     }
     const state = binds.get(bound.systemId);
@@ -129,13 +154,24 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       });
 
       if (!result.ok) {
-        log(`[smpp] ${bound.systemId} submit failed: ${result.error?.code} ${result.error?.message}`);
+        const code = String(result.error?.code || '').toLowerCase();
+        const reason = `${code} ${String(result.error?.message || '').toLowerCase()}`;
+        // Suppressed / opted-out / DNC destinations are a policy rejection, not
+        // a malformed address. Returning ESME_RINVDSTADR (0x0B) here made
+        // customers think their number formatting was wrong.
+        const suppressed = /dnc|opt.?out|suppress|unsubscrib|blocked|do_not_call/.test(reason);
         const status =
           result.status === 402
             ? smpp.ESME_RTHROTTLED
-            : result.status === 422
-              ? smpp.ESME_RINVDSTADR
-              : smpp.ESME_RSUBMITFAIL;
+            : suppressed
+              ? smpp.ESME_RSUBMITFAIL
+              : result.status === 422
+                ? smpp.ESME_RINVDSTADR
+                : smpp.ESME_RSUBMITFAIL;
+        log(
+          `[smpp] ${bound.systemId} submit failed: ${result.error?.code} ${result.error?.message}` +
+            (suppressed ? ' (suppressed destination)' : ''),
+        );
         return session.send(pdu.response({ command_status: status }));
       }
 
@@ -162,8 +198,11 @@ server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort
 // Delivery receipts + inbound MO, pushed here by the OpenTxt webhook
 // ---------------------------------------------------------------------------
 function sendDeliveryReceipt(entry, stateText, statusCode) {
-  const state = binds.get(entry.systemId);
-  if (!state) return false;
+  const targets = receiveSessions(entry.systemId);
+  if (targets.length === 0) {
+    log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
+    return false;
+  }
   const now = new Date();
   const stamp = `${String(now.getUTCFullYear()).slice(2)}${String(now.getUTCMonth() + 1).padStart(2, '0')}${String(
     now.getUTCDate(),
@@ -172,31 +211,36 @@ function sendDeliveryReceipt(entry, stateText, statusCode) {
     `id:${entry.smppMessageId} sub:001 dlvrd:${stateText === 'DELIVRD' ? '001' : '000'} ` +
     `submit date:${stamp} done date:${stamp} stat:${stateText} err:${statusCode} text:`;
 
-  state.session.deliver_sm(
-    {
-      source_addr: entry.to.replace('+', ''),
-      destination_addr: (entry.sourceAddr || '').replace('+', ''),
-      esm_class: 4, // delivery receipt
-      short_message: text,
-      receipted_message_id: entry.smppMessageId,
-      message_state: stateText === 'DELIVRD' ? 2 : 5,
-    },
-    () => {},
-  );
+  for (const session of targets) {
+    session.deliver_sm(
+      {
+        source_addr: entry.to.replace('+', ''),
+        destination_addr: (entry.sourceAddr || '').replace('+', ''),
+        esm_class: 4, // delivery receipt
+        short_message: text,
+        receipted_message_id: entry.smppMessageId,
+        message_state: stateText === 'DELIVRD' ? 2 : 5,
+      },
+      () => {},
+    );
+  }
+  log(`[webhook] DLR ${stateText} -> ${entry.systemId} on ${targets.length} session(s)`);
   return true;
 }
 
 function sendMoMessage(systemId, from, to, message) {
-  const state = binds.get(systemId);
-  if (!state) return false;
-  state.session.deliver_sm(
-    {
-      source_addr: String(from || '').replace('+', ''),
-      destination_addr: String(to || '').replace('+', ''),
-      short_message: message || '',
-    },
-    () => {},
-  );
+  const targets = receiveSessions(systemId);
+  if (targets.length === 0) return false;
+  for (const session of targets) {
+    session.deliver_sm(
+      {
+        source_addr: String(from || '').replace('+', ''),
+        destination_addr: String(to || '').replace('+', ''),
+        short_message: message || '',
+      },
+      () => {},
+    );
+  }
   return true;
 }
 
@@ -219,6 +263,9 @@ const httpServer = http.createServer((req, res) => {
         ok: true,
         smpp_port: config.smppPort,
         bound: [...binds.keys()],
+        sessions: Object.fromEntries(
+          [...binds.entries()].map(([id, s]) => [id, [...s.sessions].map((x) => x.otxtMode || '?')]),
+        ),
         tracked_messages: messageIndex.size,
       }),
     );

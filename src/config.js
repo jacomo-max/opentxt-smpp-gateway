@@ -47,7 +47,9 @@ export const config = {
   // Base URL of the OpenTxt HTTP API (single-send endpoint lives under /api-send-sms)
   apiBaseUrl: (process.env.OPENTXT_API_BASE_URL || 'https://api.opentxt.ai').replace(/\/$/, ''),
   // Shared secret the OpenTxt webhook must present to push DLRs / inbound MO into this gateway
-  webhookToken: required('GATEWAY_WEBHOOK_TOKEN'),
+  // Trim whitespace/newlines so a stray space pasted into the hosting dashboard
+  // can never 404 the DLR callbacks. Extra comma-separated tokens are ignored.
+  webhookToken: required('GATEWAY_WEBHOOK_TOKEN').split(',')[0].trim(),
   accounts: parseAccounts(),
   maxInFlight: Number(process.env.MAX_IN_FLIGHT || 200),
   logLevel: process.env.LOG_LEVEL || 'info',

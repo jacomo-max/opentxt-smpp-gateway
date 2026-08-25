@@ -58,15 +58,60 @@ function receiveSessions(systemId) {
 // ---------------------------------------------------------------------------
 // Helpers: SMPP payload decoding
 // ---------------------------------------------------------------------------
+const DATA_CODING_LABELS = new Map([
+  [0, 'smsc-default/gsm7'],
+  [1, 'ia5/ascii'],
+  [3, 'latin1'],
+  [8, 'ucs2'],
+]);
+
+function dataCodingLabel(raw) {
+  const dataCoding = Number(raw || 0);
+  return DATA_CODING_LABELS.get(dataCoding) || `vendor-specific-${dataCoding}`;
+}
+
+function decodeUcs2Be(buf) {
+  let text = '';
+  for (let i = 0; i + 1 < buf.length; i += 2) {
+    text += String.fromCharCode(buf.readUInt16BE(i));
+  }
+  return text;
+}
+
+function stripUdhIfPresent(buf, pdu) {
+  const hasUdh = (Number(pdu.esm_class || 0) & 0x40) === 0x40;
+  if (!hasUdh || buf.length === 0) return buf;
+  const udhLength = Number(buf[0]);
+  if (!Number.isFinite(udhLength) || udhLength < 0 || udhLength + 1 > buf.length) return buf;
+  return buf.subarray(udhLength + 1);
+}
+
+function shortMessageBuffer(pdu) {
+  const sm = pdu.short_message;
+  if (sm == null) return null;
+  if (Buffer.isBuffer(sm)) return sm;
+  if (typeof sm === 'object') {
+    if (Buffer.isBuffer(sm.message)) return sm.message;
+    if (typeof sm.message === 'string') return Buffer.from(sm.message, 'utf8');
+  }
+  return null;
+}
+
 function decodeShortMessage(pdu) {
-  // node-smpp gives us either a string (already decoded) or a Buffer.
+  // node-smpp gives us either a string (already decoded), an object, or a Buffer.
   const sm = pdu.short_message;
   if (sm == null) return '';
   if (typeof sm === 'string') return sm;
   if (typeof sm === 'object' && typeof sm.message === 'string') return sm.message;
-  if (Buffer.isBuffer(sm)) {
-    // data_coding 8 == UCS2
-    return pdu.data_coding === 8 ? sm.toString('ucs2') : sm.toString('latin1');
+
+  const rawBuffer = shortMessageBuffer(pdu);
+  if (rawBuffer) {
+    const payload = stripUdhIfPresent(rawBuffer, pdu);
+    const dataCoding = Number(pdu.data_coding || 0);
+    if (dataCoding === 8) return decodeUcs2Be(payload);
+    // Accept common SMPP text codings plus provider-specific text defaults.
+    // Previously customers using Latin-1/vendor DCS could see confusing data-coding errors.
+    return payload.toString(dataCoding === 1 ? 'ascii' : 'latin1');
   }
   return String(sm);
 }
@@ -137,9 +182,22 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     }
 
     const to = e164(pdu.destination_addr);
-    const message = decodeShortMessage(pdu);
+    const message = decodeShortMessage(pdu).trim();
+    const dataCoding = Number(pdu.data_coding || 0);
+    const dataCodingName = dataCodingLabel(dataCoding);
+    const messageBytes = shortMessageBuffer(pdu)?.length || Buffer.byteLength(message, 'utf8');
     if (!to || !message) {
+      log(
+        `[smpp] ${bound.systemId} invalid submit: to=${pdu.destination_addr || ''} ` +
+          `data_coding=${dataCoding}(${dataCodingName}) bytes=${messageBytes}`,
+      );
       return session.send(pdu.response({ command_status: smpp.ESME_RINVDSTADR }));
+    }
+    if (!DATA_CODING_LABELS.has(dataCoding)) {
+      log(
+        `[smpp] ${bound.systemId} accepting non-standard data_coding=${dataCoding}(${dataCodingName}) ` +
+          `as latin1 fallback bytes=${messageBytes}`,
+      );
     }
 
     state.inFlight += 1;
@@ -267,6 +325,8 @@ const httpServer = http.createServer((req, res) => {
           [...binds.entries()].map(([id, s]) => [id, [...s.sessions].map((x) => x.otxtMode || '?')]),
         ),
         tracked_messages: messageIndex.size,
+        accepted_data_codings: [0, 1, 3, 8],
+        non_standard_data_coding_fallback: 'latin1',
       }),
     );
   }

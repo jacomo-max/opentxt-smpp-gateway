@@ -38,7 +38,7 @@ function queueDurableMap(openTxtId, entry) {
   if (!entry?.systemId || !entry?.apiKey) return;
   let q = mapQueues.get(entry.systemId);
   if (!q) {
-    q = { apiKey: entry.apiKey, rows: [], timer: null };
+    q = { apiKey: entry.apiKey, rows: [], timer: null, flushing: false };
     mapQueues.set(entry.systemId, q);
   }
   q.apiKey = entry.apiKey;
@@ -59,15 +59,25 @@ function queueDurableMap(openTxtId, entry) {
 
 async function flushDurableMap(systemId) {
   const q = mapQueues.get(systemId);
-  if (!q) return;
+  if (!q || q.flushing) return;
   if (q.timer) {
     clearTimeout(q.timer);
     q.timer = null;
   }
   const entries = q.rows.splice(0, MAP_FLUSH_MAX);
   if (entries.length === 0) return;
+  q.flushing = true;
   const res = await storeMessageMap({ apiKey: q.apiKey, systemId, entries });
-  if (!res.ok) log(`[map] persist failed for ${systemId}: ${res.status || ''} ${res.error || ''}`);
+  q.flushing = false;
+  if (!res.ok) {
+    // Never discard correlation rows: without them a restart permanently loses
+    // the DLR. Put this batch back ahead of newer rows and retry shortly.
+    q.rows.unshift(...entries);
+    log(`[map] persist failed for ${systemId}: ${res.status || ''} ${res.error || ''}; retrying`);
+    q.timer = setTimeout(() => flushDurableMap(systemId), 1000);
+    q.timer.unref?.();
+    return;
+  }
   if (q.rows.length > 0) flushDurableMap(systemId);
 }
 

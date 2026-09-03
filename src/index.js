@@ -74,10 +74,22 @@ async function flushDurableMap(systemId) {
  * Resolve a webhook event to a bind entry. Falls back to the durable map when
  * the in-memory index has been wiped by a restart.
  */
+// Receipts for messages submitted before the durable map existed (or older than
+// its retention) will never resolve. Remember those misses briefly so a backlog
+// of unresolvable receipts can't turn into a lookup call per bind per receipt.
+const MISS_TTL_MS = 10 * 60 * 1000;
+const missCache = new Map(); // openTxtId -> timestamp
+setInterval(() => {
+  const cutoff = Date.now() - MISS_TTL_MS;
+  for (const [k, t] of missCache) if (t < cutoff) missCache.delete(k);
+}, 60_000).unref();
+
 async function resolveEntry(openTxtId) {
   if (!openTxtId) return null;
   const known = messageIndex.get(openTxtId);
   if (known) return known;
+  const missedAt = missCache.get(openTxtId);
+  if (missedAt && Date.now() - missedAt < MISS_TTL_MS) return null;
   // We don't know which account owns the message, so ask each bound account.
   // Binds are few (one per customer), and each key can only read its own rows.
   for (const [systemId, state] of binds) {
@@ -96,6 +108,7 @@ async function resolveEntry(openTxtId) {
     log(`[map] recovered mapping for ${openTxtId} from durable store (${systemId})`);
     return entry;
   }
+  missCache.set(openTxtId, Date.now());
   return null;
 }
 

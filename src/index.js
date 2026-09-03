@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import smpp from 'smpp';
 import { config } from './config.js';
 import { RateLimiter } from './rate-limiter.js';
-import { sendSms } from './opentxt-client.js';
+import { sendSms, storeMessageMap, lookupMessageMap } from './opentxt-client.js';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -21,6 +21,82 @@ const MESSAGE_TTL_MS = 1000 * 60 * 60 * 24; // keep 24h so late DLRs still map
 
 function rememberMessage(openTxtId, entry) {
   messageIndex.set(openTxtId, { ...entry, at: Date.now() });
+  queueDurableMap(openTxtId, entry);
+}
+
+// ---------------------------------------------------------------------------
+// Durable correlation map (survives restarts)
+// ---------------------------------------------------------------------------
+// messageIndex above lives in RAM, so a redeploy orphans every message still
+// awaiting a receipt. We mirror each mapping into OpenTxt, batched so a 250/s
+// submit rate doesn't turn into 250 extra HTTP calls per second.
+const MAP_FLUSH_MS = 250;
+const MAP_FLUSH_MAX = 200;
+const mapQueues = new Map(); // systemId -> { apiKey, rows: [], timer }
+
+function queueDurableMap(openTxtId, entry) {
+  if (!entry?.systemId || !entry?.apiKey) return;
+  let q = mapQueues.get(entry.systemId);
+  if (!q) {
+    q = { apiKey: entry.apiKey, rows: [], timer: null };
+    mapQueues.set(entry.systemId, q);
+  }
+  q.apiKey = entry.apiKey;
+  q.rows.push({
+    smpp_message_id: entry.smppMessageId,
+    request_id: openTxtId,
+    to_phone: entry.to,
+    source_addr: entry.sourceAddr || null,
+    registered_delivery: entry.registeredDelivery || 0,
+  });
+  if (q.rows.length >= MAP_FLUSH_MAX) return flushDurableMap(entry.systemId);
+  if (!q.timer) {
+    q.timer = setTimeout(() => flushDurableMap(entry.systemId), MAP_FLUSH_MS);
+    q.timer.unref?.();
+  }
+}
+
+async function flushDurableMap(systemId) {
+  const q = mapQueues.get(systemId);
+  if (!q) return;
+  if (q.timer) {
+    clearTimeout(q.timer);
+    q.timer = null;
+  }
+  const entries = q.rows.splice(0, MAP_FLUSH_MAX);
+  if (entries.length === 0) return;
+  const res = await storeMessageMap({ apiKey: q.apiKey, systemId, entries });
+  if (!res.ok) log(`[map] persist failed for ${systemId}: ${res.status || ''} ${res.error || ''}`);
+  if (q.rows.length > 0) flushDurableMap(systemId);
+}
+
+/**
+ * Resolve a webhook event to a bind entry. Falls back to the durable map when
+ * the in-memory index has been wiped by a restart.
+ */
+async function resolveEntry(openTxtId) {
+  if (!openTxtId) return null;
+  const known = messageIndex.get(openTxtId);
+  if (known) return known;
+  // We don't know which account owns the message, so ask each bound account.
+  // Binds are few (one per customer), and each key can only read its own rows.
+  for (const [systemId, state] of binds) {
+    const row = await lookupMessageMap({ apiKey: state.account.apiKey, requestId: openTxtId });
+    if (!row) continue;
+    const entry = {
+      systemId,
+      smppMessageId: row.smpp_message_id,
+      to: row.to_phone,
+      sourceAddr: row.source_addr || '',
+      registeredDelivery: Number(row.registered_delivery || 0),
+      apiKey: state.account.apiKey,
+      at: Date.now(),
+    };
+    messageIndex.set(openTxtId, entry);
+    log(`[map] recovered mapping for ${openTxtId} from durable store (${systemId})`);
+    return entry;
+  }
+  return null;
 }
 
 setInterval(() => {
@@ -154,7 +230,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     session.otxtCanSubmit = mode !== 'rx'; // tx + trx may submit
     const state = getState(systemId, account);
     state.sessions.add(session);
-    log(`[smpp] ${systemId} bound (${mode}) @ ${account.tps} tps — ${state.sessions.size} session(s)`);
+    log(`[smpp] ${systemId} bound (${mode}) @ ${account.tps} tps - ${state.sessions.size} session(s)`);
     session.send(pdu.response({ system_id: 'opentxt' }));
   }
 
@@ -239,6 +315,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         to,
         registeredDelivery: Number(pdu.registered_delivery || 0),
         sourceAddr: String(pdu.source_addr || ''),
+        apiKey: bound.apiKey,
       });
       session.send(pdu.response({ message_id: smppMessageId }));
     } catch (e) {
@@ -325,6 +402,7 @@ const httpServer = http.createServer((req, res) => {
           [...binds.entries()].map(([id, s]) => [id, [...s.sessions].map((x) => x.otxtMode || '?')]),
         ),
         tracked_messages: messageIndex.size,
+        durable_map_queue: [...mapQueues.values()].reduce((n, q) => n + q.rows.length, 0),
         accepted_data_codings: [0, 1, 3, 8],
         non_standard_data_coding_fallback: 'latin1',
       }),
@@ -337,7 +415,7 @@ const httpServer = http.createServer((req, res) => {
       raw += c;
       if (raw.length > 1_000_000) req.destroy();
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       let payload = {};
       try {
         payload = JSON.parse(raw || '{}');
@@ -349,7 +427,7 @@ const httpServer = http.createServer((req, res) => {
       const eventType = payload.event_type || 'delivered';
       try {
         if (eventType === 'delivered' || eventType === 'failed') {
-          const entry = payload.id && messageIndex.get(payload.id);
+          const entry = await resolveEntry(payload.id);
           if (entry) {
             sendDeliveryReceipt(entry, eventType === 'delivered' ? 'DELIVRD' : 'UNDELIV', eventType === 'delivered' ? '000' : '001');
           } else {
@@ -380,6 +458,8 @@ httpServer.listen(config.httpPort, () => log(`[http] listening on :${config.http
 
 process.on('SIGTERM', () => {
   log('shutting down');
+  // Persist anything still buffered so a redeploy can't orphan it.
+  for (const systemId of mapQueues.keys()) flushDurableMap(systemId);
   server.close();
   httpServer.close(() => process.exit(0));
 });

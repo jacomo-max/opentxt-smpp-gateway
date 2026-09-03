@@ -44,10 +44,11 @@ function queueDurableMap(openTxtId, entry) {
   q.apiKey = entry.apiKey;
   q.rows.push({
     smpp_message_id: entry.smppMessageId,
-    request_id: openTxtId,
+    supplier_message_id: entry.supplierMessageId || null,
+    request_id: entry.requestId || openTxtId,
     to_phone: entry.to,
     source_addr: entry.sourceAddr || null,
-    registered_delivery: entry.registeredDelivery || 0,
+    registered_delivery: entry.registeredDelivery ?? 0,
   });
   if (q.rows.length >= MAP_FLUSH_MAX) return flushDurableMap(entry.systemId);
   if (!q.timer) {
@@ -325,6 +326,8 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       rememberMessage(result.id, {
         systemId: bound.systemId,
         smppMessageId,
+        supplierMessageId: result.raw?.supplier_message_id || result.raw?.data?.supplier_message_id || null,
+        requestId: result.id,
         to,
         registeredDelivery: Number(pdu.registered_delivery || 0),
         sourceAddr: String(pdu.source_addr || ''),

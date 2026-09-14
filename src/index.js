@@ -155,6 +155,24 @@ function receiveSessions(systemId) {
   return [...state.sessions].filter((s) => s.otxtCanReceive);
 }
 
+/**
+ * Pick exactly ONE session to hand a deliver_sm to.
+ *
+ * An ESME that holds several trx sessions for throughput must still receive a
+ * single receipt per message — fanning the same DLR out to every open session
+ * made customers see 2-3 duplicate receipts for one submit and broke their
+ * reconciliation. Prefer the session that submitted the message (still bound
+ * and receive-capable), otherwise round-robin so load spreads evenly.
+ */
+function pickReceiveSession(systemId, preferred) {
+  const targets = receiveSessions(systemId);
+  if (targets.length === 0) return null;
+  if (preferred && targets.includes(preferred)) return preferred;
+  const state = binds.get(systemId);
+  state.rrCursor = ((state.rrCursor ?? 0) + 1) % targets.length;
+  return targets[state.rrCursor];
+}
+
 // ---------------------------------------------------------------------------
 // Helpers: SMPP payload decoding
 // ---------------------------------------------------------------------------
@@ -342,6 +360,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         registeredDelivery: Number(pdu.registered_delivery || 0),
         sourceAddr: String(pdu.source_addr || ''),
         apiKey: bound.apiKey,
+        session,
       });
       session.send(pdu.response({ message_id: smppMessageId }));
     } catch (e) {
@@ -359,8 +378,8 @@ server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort
 // Delivery receipts + inbound MO, pushed here by the OpenTxt webhook
 // ---------------------------------------------------------------------------
 function sendDeliveryReceipt(entry, stateText, statusCode) {
-  const targets = receiveSessions(entry.systemId);
-  if (targets.length === 0) {
+  const target = pickReceiveSession(entry.systemId, entry.session);
+  if (!target) {
     log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
     return false;
   }
@@ -372,8 +391,8 @@ function sendDeliveryReceipt(entry, stateText, statusCode) {
     `id:${entry.smppMessageId} sub:001 dlvrd:${stateText === 'DELIVRD' ? '001' : '000'} ` +
     `submit date:${stamp} done date:${stamp} stat:${stateText} err:${statusCode} text:`;
 
-  for (const session of targets) {
-    session.deliver_sm(
+  {
+    target.deliver_sm(
       {
         source_addr: entry.to.replace('+', ''),
         destination_addr: (entry.sourceAddr || '').replace('+', ''),
@@ -385,15 +404,16 @@ function sendDeliveryReceipt(entry, stateText, statusCode) {
       () => {},
     );
   }
-  log(`[webhook] DLR ${stateText} -> ${entry.systemId} on ${targets.length} session(s)`);
+  log(`[webhook] DLR ${stateText} -> ${entry.systemId} (1 session)`);
   return true;
 }
 
 function sendMoMessage(systemId, from, to, message) {
-  const targets = receiveSessions(systemId);
-  if (targets.length === 0) return false;
-  for (const session of targets) {
-    session.deliver_sm(
+  // Same rule as receipts: one copy of an inbound message, not one per session.
+  const target = pickReceiveSession(systemId, null);
+  if (!target) return false;
+  {
+    target.deliver_sm(
       {
         source_addr: String(from || '').replace('+', ''),
         destination_addr: String(to || '').replace('+', ''),

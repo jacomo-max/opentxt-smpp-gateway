@@ -391,7 +391,7 @@ server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort
 // ---------------------------------------------------------------------------
 // Delivery receipts + inbound MO, pushed here by the OpenTxt webhook
 // ---------------------------------------------------------------------------
-function sendDeliveryReceipt(entry, stateText, statusCode) {
+async function sendDeliveryReceipt(entry, stateText, statusCode) {
   const target = pickReceiveSession(entry.systemId, entry.session, entry.submitSessionId);
   if (!target) {
     log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
@@ -405,21 +405,38 @@ function sendDeliveryReceipt(entry, stateText, statusCode) {
     `id:${entry.smppMessageId} sub:001 dlvrd:${stateText === 'DELIVRD' ? '001' : '000'} ` +
     `submit date:${stamp} done date:${stamp} stat:${stateText} err:${statusCode} text:`;
 
-  {
-    target.deliver_sm(
-      {
-        source_addr: entry.to.replace('+', ''),
-        destination_addr: (entry.sourceAddr || '').replace('+', ''),
-        esm_class: 4, // delivery receipt
-        short_message: text,
-        receipted_message_id: entry.smppMessageId,
-        message_state: stateText === 'DELIVRD' ? 2 : 5,
-      },
-      () => {},
-    );
-  }
-  log(`[webhook] DLR ${stateText} -> ${entry.systemId} (1 session)`);
-  return true;
+  const acknowledged = await new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), 10_000);
+    timer.unref?.();
+    try {
+      target.deliver_sm(
+        {
+          source_addr: entry.to.replace('+', ''),
+          destination_addr: (entry.sourceAddr || '').replace('+', ''),
+          esm_class: 4, // delivery receipt
+          short_message: text,
+          receipted_message_id: entry.smppMessageId,
+          message_state: stateText === 'DELIVRD' ? 2 : 5,
+        },
+        (pdu) => finish(Number(pdu?.command_status ?? -1) === 0),
+      );
+    } catch (error) {
+      log(`[webhook] DLR send error for ${entry.systemId}: ${error?.message || error}`);
+      finish(false);
+    }
+  });
+  log(
+    `[webhook] DLR ${stateText} -> ${entry.systemId} session=${target.otxtSessionId || '?'} ` +
+      `ack=${acknowledged ? 'ok' : 'missing'}`,
+  );
+  return acknowledged;
 }
 
 function sendMoMessage(systemId, from, to, message) {
@@ -488,10 +505,21 @@ const httpServer = http.createServer((req, res) => {
       try {
         if (eventType === 'delivered' || eventType === 'failed') {
           const entry = await resolveEntry(payload.id);
-          if (entry) {
-            sendDeliveryReceipt(entry, eventType === 'delivered' ? 'DELIVRD' : 'UNDELIV', eventType === 'delivered' ? '000' : '001');
-          } else {
+          if (!entry) {
             log(`[webhook] no mapping for message ${payload.id} (${eventType})`);
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+            res.end(JSON.stringify({ ok: false, retryable: true, error: 'message mapping unavailable' }));
+            return;
+          }
+          const acknowledged = await sendDeliveryReceipt(
+            entry,
+            eventType === 'delivered' ? 'DELIVRD' : 'UNDELIV',
+            eventType === 'delivered' ? '000' : '001',
+          );
+          if (!acknowledged) {
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });
+            res.end(JSON.stringify({ ok: false, retryable: true, error: 'deliver_sm not acknowledged' }));
+            return;
           }
         } else if (eventType === 'inbound_reply' || eventType === 'opt_out') {
           const systemId = findSystemIdForApiKeyEvent(payload);

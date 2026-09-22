@@ -48,6 +48,7 @@ function queueDurableMap(openTxtId, entry) {
     request_id: entry.requestId || openTxtId,
     to_phone: entry.to,
     source_addr: entry.sourceAddr || null,
+    submit_session_id: entry.submitSessionId || null,
     registered_delivery: entry.registeredDelivery ?? 0,
   });
   if (q.rows.length >= MAP_FLUSH_MAX) return flushDurableMap(entry.systemId);
@@ -111,6 +112,7 @@ async function resolveEntry(openTxtId) {
       smppMessageId: row.smpp_message_id,
       to: row.to_phone,
       sourceAddr: row.source_addr || '',
+      submitSessionId: row.submit_session_id || null,
       registeredDelivery: Number(row.registered_delivery || 0),
       apiKey: state.account.apiKey,
       at: Date.now(),
@@ -164,10 +166,14 @@ function receiveSessions(systemId) {
  * reconciliation. Prefer the session that submitted the message (still bound
  * and receive-capable), otherwise round-robin so load spreads evenly.
  */
-function pickReceiveSession(systemId, preferred) {
+function pickReceiveSession(systemId, preferred, preferredSessionId) {
   const targets = receiveSessions(systemId);
   if (targets.length === 0) return null;
   if (preferred && targets.includes(preferred)) return preferred;
+  if (preferredSessionId) {
+    const restored = targets.find((target) => target.otxtSessionId === preferredSessionId);
+    if (restored) return restored;
+  }
   const state = binds.get(systemId);
   state.rrCursor = ((state.rrCursor ?? 0) + 1) % targets.length;
   return targets[state.rrCursor];
@@ -268,6 +274,13 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     }
     bound = account;
     session.otxtMode = mode;
+    // Give parallel binds a stable account-local slot. Clients normally reconnect
+    // their workers in the same order, allowing a persisted submit slot to route
+    // a delayed receipt back to that worker after a gateway restart.
+    const usedSessionIds = new Set([...getState(systemId, account).sessions].map((s) => s.otxtSessionId));
+    let sessionOrdinal = 1;
+    while (usedSessionIds.has(`${mode}:${sessionOrdinal}`)) sessionOrdinal += 1;
+    session.otxtSessionId = `${mode}:${sessionOrdinal}`;
     session.otxtCanReceive = mode !== 'tx'; // rx + trx get deliver_sm
     session.otxtCanSubmit = mode !== 'rx'; // tx + trx may submit
     const state = getState(systemId, account);
@@ -361,6 +374,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         sourceAddr: String(pdu.source_addr || ''),
         apiKey: bound.apiKey,
         session,
+        submitSessionId: session.otxtSessionId,
       });
       session.send(pdu.response({ message_id: smppMessageId }));
     } catch (e) {
@@ -378,7 +392,7 @@ server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort
 // Delivery receipts + inbound MO, pushed here by the OpenTxt webhook
 // ---------------------------------------------------------------------------
 function sendDeliveryReceipt(entry, stateText, statusCode) {
-  const target = pickReceiveSession(entry.systemId, entry.session);
+  const target = pickReceiveSession(entry.systemId, entry.session, entry.submitSessionId);
   if (!target) {
     log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
     return false;
@@ -410,7 +424,7 @@ function sendDeliveryReceipt(entry, stateText, statusCode) {
 
 function sendMoMessage(systemId, from, to, message) {
   // Same rule as receipts: one copy of an inbound message, not one per session.
-  const target = pickReceiveSession(systemId, null);
+  const target = pickReceiveSession(systemId, null, null);
   if (!target) return false;
   {
     target.deliver_sm(

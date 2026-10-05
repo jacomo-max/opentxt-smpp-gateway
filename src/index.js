@@ -456,9 +456,10 @@ function sendMoMessage(systemId, from, to, message) {
   return true;
 }
 
-function findSystemIdForApiKeyEvent(payload) {
-  // Prefer the mapping we stored at submit time.
-  const known = payload.id && messageIndex.get(payload.id);
+async function findSystemIdForApiKeyEvent(payload) {
+  // Prefer the mapping we stored at submit time, then the durable store
+  // (replies to texts that were held and replayed carry the replayed id).
+  const known = payload.id && (await resolveEntry(payload.id));
   if (known) return known.systemId;
   // Single-account gateways: fall back to the only bind.
   if (binds.size === 1) return [...binds.keys()][0];
@@ -522,7 +523,7 @@ const httpServer = http.createServer((req, res) => {
             return;
           }
         } else if (eventType === 'inbound_reply' || eventType === 'opt_out') {
-          const systemId = findSystemIdForApiKeyEvent(payload);
+          const systemId = await findSystemIdForApiKeyEvent(payload);
           if (systemId) {
             sendMoMessage(systemId, payload.from || payload.to_phone, payload.to || payload.from_phone, payload.message || payload.body);
           } else {

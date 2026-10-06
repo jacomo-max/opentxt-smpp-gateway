@@ -52,5 +52,10 @@ export const config = {
   webhookToken: required('GATEWAY_WEBHOOK_TOKEN').split(',')[0].trim(),
   accounts: parseAccounts(),
   maxInFlight: Number(process.env.MAX_IN_FLIGHT || 200),
+  // Longest we hold a submit_sm_resp waiting on the backend before acknowledging
+  // anyway (customers commonly time out at 30-60s).
+  submitAckMs: Number(process.env.SUBMIT_ACK_MS || 8000),
+  // Hard cap on one backend send call; retried once with the same idempotency key.
+  sendTimeoutMs: Number(process.env.SEND_TIMEOUT_MS || 90000),
   logLevel: process.env.LOG_LEVEL || 'info',
 };

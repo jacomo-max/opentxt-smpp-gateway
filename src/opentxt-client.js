@@ -10,15 +10,22 @@ export async function sendSms({ apiKey, to, message, idempotencyKey }) {
   };
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
+  // Bounded wait so a stuck backend call can never hold a message forever.
+  // A timed-out call is retried once with the same idempotency key, so it can
+  // never be sent or charged twice.
   let res;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ to, message }),
-    });
-  } catch (e) {
-    return { ok: false, error: { code: 'network_error', message: e.message } };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ to, message }),
+        signal: AbortSignal.timeout(config.sendTimeoutMs),
+      });
+      break;
+    } catch (e) {
+      if (attempt === 1) return { ok: false, error: { code: 'network_error', message: e.message } };
+    }
   }
 
   let body = {};

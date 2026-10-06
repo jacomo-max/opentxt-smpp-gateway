@@ -331,16 +331,51 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       );
     }
 
+    // Fast acknowledgement: never make the customer wait on our backend.
+    // We wait up to SUBMIT_ACK_MS for the real answer (so normal refusals keep
+    // their exact SMPP error code). If the backend is slower than that, we
+    // acknowledge with our message_id right away and finish in the background;
+    // a late refusal is reported to the customer as a REJECTD delivery receipt.
     state.inFlight += 1;
+    const smppMessageId = shortId();
+    const submitEntry = {
+      systemId: bound.systemId,
+      smppMessageId,
+      to,
+      registeredDelivery: Number(pdu.registered_delivery || 0),
+      sourceAddr: String(pdu.source_addr || ''),
+      apiKey: bound.apiKey,
+      session,
+      submitSessionId: session.otxtSessionId,
+    };
+    let responded = false;
+    const respond = (fields) => {
+      if (responded) return;
+      responded = true;
+      clearTimeout(ackTimer);
+      try {
+        session.send(pdu.response(fields));
+      } catch (e) {
+        log(`[smpp] ${bound.systemId} submit_sm_resp send error: ${e?.message || e}`);
+      }
+    };
+    const startedAt = Date.now();
+    const ackTimer = setTimeout(() => {
+      log(`[smpp] ${bound.systemId} early ack ${smppMessageId} after ${config.submitAckMs}ms (backend slow)`);
+      respond({ message_id: smppMessageId });
+    }, config.submitAckMs);
+    ackTimer.unref?.();
+
     try {
       await state.limiter.take();
-      const smppMessageId = shortId();
       const result = await sendSms({
         apiKey: bound.apiKey,
         to,
         message,
         idempotencyKey: `smpp_${bound.systemId}_${smppMessageId}`,
       });
+      const tookMs = Date.now() - startedAt;
+      if (tookMs > 3000) log(`[smpp] ${bound.systemId} slow accept ${smppMessageId} ${tookMs}ms`);
 
       if (!result.ok) {
         const code = String(result.error?.code || '').toLowerCase();
@@ -359,28 +394,28 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
                 : smpp.ESME_RSUBMITFAIL;
         log(
           `[smpp] ${bound.systemId} submit failed: ${result.error?.code} ${result.error?.message}` +
-            (suppressed ? ' (suppressed destination)' : ''),
+            (suppressed ? ' (suppressed destination)' : '') +
+            (responded ? ' (after early ack, sending REJECTD receipt)' : ''),
         );
-        return session.send(pdu.response({ command_status: status }));
+        if (!responded) return respond({ command_status: status });
+        if (submitEntry.registeredDelivery & 1) {
+          sendDeliveryReceipt(submitEntry, 'REJECTD', '001').catch(() => {});
+        }
+        return;
       }
 
       rememberMessage(result.id, {
-        systemId: bound.systemId,
-        smppMessageId,
+        ...submitEntry,
         supplierMessageId: result.raw?.supplier_message_id || result.raw?.data?.supplier_message_id || null,
         requestId: result.id,
-        to,
-        registeredDelivery: Number(pdu.registered_delivery || 0),
-        sourceAddr: String(pdu.source_addr || ''),
-        apiKey: bound.apiKey,
-        session,
-        submitSessionId: session.otxtSessionId,
       });
-      session.send(pdu.response({ message_id: smppMessageId }));
+      respond({ message_id: smppMessageId });
     } catch (e) {
       log('[smpp] submit_sm error', e?.message);
-      session.send(pdu.response({ command_status: smpp.ESME_RSUBMITFAIL }));
+      if (!responded) respond({ command_status: smpp.ESME_RSUBMITFAIL });
+      else if (submitEntry.registeredDelivery & 1) sendDeliveryReceipt(submitEntry, 'REJECTD', '001').catch(() => {});
     } finally {
+      clearTimeout(ackTimer);
       state.inFlight -= 1;
     }
   });
@@ -545,10 +580,16 @@ const httpServer = http.createServer((req, res) => {
 
 httpServer.listen(config.httpPort, () => log(`[http] listening on :${config.httpPort}`));
 
-process.on('SIGTERM', () => {
-  log('shutting down');
-  // Persist anything still buffered so a redeploy can't orphan it.
-  for (const systemId of mapQueues.keys()) flushDurableMap(systemId);
+process.on('SIGTERM', async () => {
+  log('shutting down: draining in-flight submits');
+  // Stop taking new binds, let every submit already accepted finish (and get
+  // its submit_sm_resp), persist the map, then exit. Capped at 25s.
   server.close();
+  const deadline = Date.now() + 25_000;
+  const inFlight = () => [...binds.values()].reduce((n, b) => n + (b.inFlight || 0), 0);
+  while (inFlight() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  for (const systemId of mapQueues.keys()) await flushDurableMap(systemId);
+  log(`drained (in-flight left: ${inFlight()}), exiting`);
   httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
 });

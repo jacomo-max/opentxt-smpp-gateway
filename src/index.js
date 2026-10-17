@@ -96,7 +96,7 @@ setInterval(() => {
   for (const [k, t] of missCache) if (t < cutoff) missCache.delete(k);
 }, 60_000).unref();
 
-async function resolveEntry(openTxtId) {
+async function resolveEntry(openTxtId, systemIdHint = null) {
   if (!openTxtId) return null;
   const known = messageIndex.get(openTxtId);
   if (known) return known;
@@ -104,7 +104,12 @@ async function resolveEntry(openTxtId) {
   if (missedAt && Date.now() - missedAt < MISS_TTL_MS) return null;
   // We don't know which account owns the message, so ask each bound account.
   // Binds are few (one per customer), and each key can only read its own rows.
-  for (const [systemId, state] of binds) {
+  // A private webhook hint narrows the lookup to the owning account.
+  // It grants no access: lookupMessageMap still authenticates that account key.
+  // Missing hints retain legacy behavior for existing callers.
+  const hinted = systemIdHint && binds.get(String(systemIdHint));
+  const candidates = hinted ? [[String(systemIdHint), hinted]] : [...binds.entries()];
+  for (const [systemId, state] of candidates) {
     const row = await lookupMessageMap({ apiKey: state.account.apiKey, requestId: openTxtId });
     if (!row) continue;
     const entry = {
@@ -509,6 +514,7 @@ const httpServer = http.createServer((req, res) => {
     return res.end(
       JSON.stringify({
         ok: true,
+        receipt_account_hint: true,
         smpp_port: config.smppPort,
         bound: [...binds.keys()],
         sessions: Object.fromEntries(
@@ -540,7 +546,7 @@ const httpServer = http.createServer((req, res) => {
       const eventType = payload.event_type || 'delivered';
       try {
         if (eventType === 'delivered' || eventType === 'failed') {
-          const entry = await resolveEntry(payload.id);
+          const entry = await resolveEntry(payload.id, payload.smpp_system_id_hint);
           if (!entry) {
             log(`[webhook] no mapping for message ${payload.id} (${eventType})`);
             res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });

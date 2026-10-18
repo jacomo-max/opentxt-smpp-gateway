@@ -96,10 +96,29 @@ setInterval(() => {
   for (const [k, t] of missCache) if (t < cutoff) missCache.delete(k);
 }, 60_000).unref();
 
-async function resolveEntry(openTxtId, systemIdHint = null) {
+async function resolveEntry(openTxtId, systemIdHint = null, providedMap = null) {
   if (!openTxtId) return null;
   const known = messageIndex.get(openTxtId);
   if (known) return known;
+  // The backend batch-reads the durable map and sends the mapping along with
+  // the receipt, so backlog receipts need no per-message lookup call. Only
+  // trusted for an account that is bound here (webhook path is token-gated).
+  if (providedMap?.smpp_message_id && providedMap.system_id && binds.has(String(providedMap.system_id))) {
+    const systemId = String(providedMap.system_id);
+    const state = binds.get(systemId);
+    const entry = {
+      systemId,
+      smppMessageId: providedMap.smpp_message_id,
+      to: providedMap.to_phone,
+      sourceAddr: providedMap.source_addr || '',
+      submitSessionId: providedMap.submit_session_id || null,
+      registeredDelivery: Number(providedMap.registered_delivery || 0),
+      apiKey: state.account.apiKey,
+      at: Date.now(),
+    };
+    messageIndex.set(openTxtId, entry);
+    return entry;
+  }
   const missedAt = missCache.get(openTxtId);
   if (missedAt && Date.now() - missedAt < MISS_TTL_MS) return null;
   // We don't know which account owns the message, so ask each bound account.
@@ -137,6 +156,20 @@ setInterval(() => {
 
 // SMPP message_id must be a short opaque string; we hand the customer a hex id
 // and keep the mapping to the OpenTxt UUID in memory.
+// Waiting parts of long texts, keyed by account|from|to|ref|total.
+const partGroups = new Map();
+const PART_WAIT_MS = 60_000;
+function expirePartGroup(key) {
+  const g = partGroups.get(key);
+  if (!g) return;
+  partGroups.delete(key);
+  // Never send a text with missing pieces; tell the customer it failed.
+  log(`[smpp] ${g.systemId} long text incomplete after ${PART_WAIT_MS / 1000}s (${g.parts.size} parts), rejecting`);
+  if (g.registeredDelivery & 1) {
+    sendDeliveryReceipt({ ...g, smppMessageId: g.ids[0], extraSmppIds: g.ids.slice(1) }, 'REJECTD', '001').catch(() => {});
+  }
+}
+
 function shortId() {
   return crypto.randomBytes(8).toString('hex').toUpperCase();
 }
@@ -213,6 +246,35 @@ function stripUdhIfPresent(buf, pdu) {
   const udhLength = Number(buf[0]);
   if (!Number.isFinite(udhLength) || udhLength < 0 || udhLength + 1 > buf.length) return buf;
   return buf.subarray(udhLength + 1);
+}
+
+// Concatenated (long) texts: read the part reference from the UDH (IE 0x00 /
+// 0x08) or the sar_* TLVs. Returns { ref, total, seq } or null.
+export function concatInfo(pdu, buf) {
+  if (pdu.sar_msg_ref_num != null && Number(pdu.sar_total_segments) > 1) {
+    return { ref: Number(pdu.sar_msg_ref_num), total: Number(pdu.sar_total_segments), seq: Number(pdu.sar_segment_seqnum) };
+  }
+  // node-smpp already splits the UDH into information elements [iei, len, ...].
+  const ies = pdu.short_message && Array.isArray(pdu.short_message.udh) ? pdu.short_message.udh : null;
+  if (ies) {
+    for (const ie of ies) {
+      if (ie[0] === 0x00 && ie[1] === 3) return { ref: ie[2], total: ie[3], seq: ie[4] };
+      if (ie[0] === 0x08 && ie[1] === 4) return { ref: (ie[2] << 8) | ie[3], total: ie[4], seq: ie[5] };
+    }
+    return null;
+  }
+  const hasUdh = (Number(pdu.esm_class || 0) & 0x40) === 0x40;
+  if (!hasUdh || !buf || buf.length < 2) return null;
+  const udhl = buf[0];
+  let i = 1;
+  while (i + 1 < udhl + 1 && i + 1 < buf.length) {
+    const iei = buf[i];
+    const len = buf[i + 1];
+    if (iei === 0x00 && len === 3) return { ref: buf[i + 2], total: buf[i + 3], seq: buf[i + 4] };
+    if (iei === 0x08 && len === 4) return { ref: (buf[i + 2] << 8) | buf[i + 3], total: buf[i + 4], seq: buf[i + 5] };
+    i += 2 + len;
+  }
+  return null;
 }
 
 function shortMessageBuffer(pdu) {
@@ -336,18 +398,49 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       );
     }
 
+    // Long texts arrive as several submit_sm parts. Join them and send ONE
+    // text, otherwise the handset gets each part as a separate message.
+    let extraSmppIds = [];
+    let finalMessage = message;
+    const part = concatInfo(pdu, shortMessageBuffer(pdu));
+    if (part && part.total > 1 && part.seq >= 1 && part.seq <= part.total) {
+      const key = `${bound.systemId}|${pdu.source_addr || ''}|${to}|${part.ref}|${part.total}`;
+      let group = partGroups.get(key);
+      if (!group) {
+        group = { parts: new Map(), ids: [], registeredDelivery: 0, session, systemId: bound.systemId, to, sourceAddr: String(pdu.source_addr || ''), submitSessionId: session.otxtSessionId };
+        group.timer = setTimeout(() => expirePartGroup(key), PART_WAIT_MS);
+        group.timer.unref?.();
+        partGroups.set(key, group);
+      }
+      group.parts.set(part.seq, decodeShortMessage(pdu));
+      group.registeredDelivery |= Number(pdu.registered_delivery || 0);
+      const partId = shortId();
+      group.ids.push(partId);
+      if (group.parts.size < part.total) {
+        return session.send(pdu.response({ message_id: partId }));
+      }
+      clearTimeout(group.timer);
+      partGroups.delete(key);
+      finalMessage = [...group.parts.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t).join('').trim();
+      extraSmppIds = group.ids.filter((id) => id !== partId);
+      pdu.__otxtPartId = partId;
+      pdu.__otxtRegistered = group.registeredDelivery;
+      log(`[smpp] ${bound.systemId} joined ${part.total}-part text ref=${part.ref}`);
+    }
+
     // Fast acknowledgement: never make the customer wait on our backend.
     // We wait up to SUBMIT_ACK_MS for the real answer (so normal refusals keep
     // their exact SMPP error code). If the backend is slower than that, we
     // acknowledge with our message_id right away and finish in the background;
     // a late refusal is reported to the customer as a REJECTD delivery receipt.
     state.inFlight += 1;
-    const smppMessageId = shortId();
+    const smppMessageId = pdu.__otxtPartId || shortId();
     const submitEntry = {
       systemId: bound.systemId,
       smppMessageId,
+      extraSmppIds,
       to,
-      registeredDelivery: Number(pdu.registered_delivery || 0),
+      registeredDelivery: Number(pdu.__otxtRegistered ?? pdu.registered_delivery ?? 0),
       sourceAddr: String(pdu.source_addr || ''),
       apiKey: bound.apiKey,
       session,
@@ -376,7 +469,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       const result = await sendSms({
         apiKey: bound.apiKey,
         to,
-        message,
+        message: finalMessage,
         idempotencyKey: `smpp_${bound.systemId}_${smppMessageId}`,
       });
       const tookMs = Date.now() - startedAt;
@@ -432,6 +525,17 @@ server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort
 // Delivery receipts + inbound MO, pushed here by the OpenTxt webhook
 // ---------------------------------------------------------------------------
 async function sendDeliveryReceipt(entry, stateText, statusCode) {
+  // A joined long text owes the customer one receipt per part they submitted.
+  const ids = [entry.smppMessageId, ...(entry.extraSmppIds || [])].filter(Boolean);
+  if (ids.length > 1) {
+    const results = [];
+    for (const id of ids) results.push(await sendOneReceipt({ ...entry, smppMessageId: id }, stateText, statusCode));
+    return results.every(Boolean);
+  }
+  return sendOneReceipt(entry, stateText, statusCode);
+}
+
+async function sendOneReceipt(entry, stateText, statusCode) {
   const target = pickReceiveSession(entry.systemId, entry.session, entry.submitSessionId);
   if (!target) {
     log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
@@ -499,7 +603,7 @@ function sendMoMessage(systemId, from, to, message) {
 async function findSystemIdForApiKeyEvent(payload) {
   // Prefer the mapping we stored at submit time, then the durable store
   // (replies to texts that were held and replayed carry the replayed id).
-  const known = payload.id && (await resolveEntry(payload.id));
+  const known = payload.id && (await resolveEntry(payload.id, payload.smpp_system_id_hint, payload.smpp_map));
   if (known) return known.systemId;
   // Single-account gateways: fall back to the only bind.
   if (binds.size === 1) return [...binds.keys()][0];
@@ -546,7 +650,7 @@ const httpServer = http.createServer((req, res) => {
       const eventType = payload.event_type || 'delivered';
       try {
         if (eventType === 'delivered' || eventType === 'failed') {
-          const entry = await resolveEntry(payload.id, payload.smpp_system_id_hint);
+          const entry = await resolveEntry(payload.id, payload.smpp_system_id_hint, payload.smpp_map);
           if (!entry) {
             log(`[webhook] no mapping for message ${payload.id} (${eventType})`);
             res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '5' });

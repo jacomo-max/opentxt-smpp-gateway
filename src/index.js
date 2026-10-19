@@ -160,10 +160,17 @@ setInterval(() => {
 // Waiting parts of long texts, keyed by account|from|to|ref|total.
 const partGroups = new Map();
 const PART_WAIT_MS = 60_000;
+const STRICT_PART_WAIT_MS = 20_000;
 function expirePartGroup(key) {
   const g = partGroups.get(key);
   if (!g) return;
   partGroups.delete(key);
+  if (g.pendingResponses) {
+    for (const item of g.pendingResponses) {
+      try { item.session.send(item.pdu.response({ command_status: smpp.ESME_RSUBMITFAIL })); } catch {}
+    }
+    return;
+  }
   // Never send a text with missing pieces; tell the customer it failed.
   log(`[smpp] ${g.systemId} long text incomplete after ${PART_WAIT_MS / 1000}s (${g.parts.size} parts), rejecting`);
   if (g.registeredDelivery & 1) {
@@ -401,6 +408,8 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
 
     // Long texts arrive as several submit_sm parts. Join them and send ONE
     // text, otherwise the handset gets each part as a separate message.
+    const strictSubmit = strictSubmitFor(bound.systemId);
+    let pendingPartResponses = [];
     let extraSmppIds = [];
     let finalMessage = message;
     const part = concatInfo(pdu, shortMessageBuffer(pdu));
@@ -409,7 +418,8 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       let group = partGroups.get(key);
       if (!group) {
         group = { parts: new Map(), ids: [], registeredDelivery: 0, session, systemId: bound.systemId, to, sourceAddr: String(pdu.source_addr || ''), submitSessionId: session.otxtSessionId };
-        group.timer = setTimeout(() => expirePartGroup(key), PART_WAIT_MS);
+        if (strictSubmit) group.pendingResponses = [];
+        group.timer = setTimeout(() => expirePartGroup(key), strictSubmit ? STRICT_PART_WAIT_MS : PART_WAIT_MS);
         group.timer.unref?.();
         partGroups.set(key, group);
       }
@@ -417,9 +427,12 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       group.registeredDelivery |= Number(pdu.registered_delivery || 0);
       const partId = shortId();
       group.ids.push(partId);
+      if (strictSubmit) group.pendingResponses.push({ session, pdu, partId });
       if (group.parts.size < part.total) {
+        if (strictSubmit) return;
         return session.send(pdu.response({ message_id: partId }));
       }
+      if (strictSubmit) pendingPartResponses = group.pendingResponses;
       clearTimeout(group.timer);
       partGroups.delete(key);
       finalMessage = [...group.parts.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t).join('').trim();
@@ -453,12 +466,17 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       responded = true;
       clearTimeout(ackTimer);
       try {
-        session.send(pdu.response(fields));
+        if (pendingPartResponses.length) {
+          for (const item of pendingPartResponses) {
+            try { item.session.send(item.pdu.response(fields.command_status ? fields : { ...fields, message_id: item.partId })); } catch {}
+          }
+        } else {
+          session.send(pdu.response(fields));
+        }
       } catch (e) {
         log(`[smpp] ${bound.systemId} submit_sm_resp send error: ${e?.message || e}`);
       }
     };
-    const strictSubmit = strictSubmitFor(bound.systemId);
     const startedAt = Date.now();
     const ackTimer = strictSubmit ? null : setTimeout(() => {
       log(`[smpp] ${bound.systemId} early ack ${smppMessageId} after ${config.submitAckMs}ms (backend slow)`);

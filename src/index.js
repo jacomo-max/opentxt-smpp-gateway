@@ -2,6 +2,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import smpp from 'smpp';
 import { config } from './config.js';
+import { strictSubmitFor, submitFailureStatus } from './submit-policy.js';
 import { RateLimiter } from './rate-limiter.js';
 import { sendSms, storeMessageMap, lookupMessageMap } from './opentxt-client.js';
 
@@ -457,17 +458,19 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         log(`[smpp] ${bound.systemId} submit_sm_resp send error: ${e?.message || e}`);
       }
     };
+    const strictSubmit = strictSubmitFor(bound.systemId);
     const startedAt = Date.now();
-    const ackTimer = setTimeout(() => {
+    const ackTimer = strictSubmit ? null : setTimeout(() => {
       log(`[smpp] ${bound.systemId} early ack ${smppMessageId} after ${config.submitAckMs}ms (backend slow)`);
       respond({ message_id: smppMessageId });
     }, config.submitAckMs);
-    ackTimer.unref?.();
+    ackTimer?.unref?.();
 
     try {
       await state.limiter.take();
       const result = await sendSms({
         apiKey: bound.apiKey,
+        strictSubmit,
         to,
         message: finalMessage,
         idempotencyKey: `smpp_${bound.systemId}_${smppMessageId}`,
@@ -482,14 +485,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         // a malformed address. Returning ESME_RINVDSTADR (0x0B) here made
         // customers think their number formatting was wrong.
         const suppressed = /dnc|opt.?out|suppress|unsubscrib|blocked|do_not_call/.test(reason);
-        const status =
-          result.status === 402
-            ? smpp.ESME_RTHROTTLED
-            : suppressed
-              ? smpp.ESME_RSUBMITFAIL
-              : result.status === 422
-                ? smpp.ESME_RINVDSTADR
-                : smpp.ESME_RSUBMITFAIL;
+        const status = submitFailureStatus(result);
         log(
           `[smpp] ${bound.systemId} submit failed: ${result.error?.code} ${result.error?.message}` +
             (suppressed ? ' (suppressed destination)' : '') +

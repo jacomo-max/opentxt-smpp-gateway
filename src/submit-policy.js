@@ -1,5 +1,5 @@
 // Mirrored into the separate gateway repository; contains no credentials.
-const strictSystems = new Set(['mmdsmart', 'otxt04', 'otxt05', 'otxt17']);
+const strictSystems = new Set(['mmdsmart', 'otxt01', 'otxt04', 'otxt05', 'otxt17']);
 export const strictSubmitFor = systemId => strictSystems.has(String(systemId).toLowerCase());
 export function submitFailureStatus(result) {
   const status = result.error?.smpp?.command_status;

@@ -492,10 +492,24 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         to,
         message: finalMessage,
         idempotencyKey: `smpp_${bound.systemId}_${smppMessageId}`,
+        receivedAt: startedAt,
+        sourceAddr: submitEntry.sourceAddr,
+        registeredDelivery: submitEntry.registeredDelivery,
+        sessionId: submitEntry.submitSessionId,
       });
       const tookMs = Date.now() - startedAt;
       if (tookMs > 3000) log(`[smpp] ${bound.systemId} slow accept ${smppMessageId} ${tookMs}ms`);
 
+      if (!result.ok && (result.error?.code === 'network_error' || Date.now() - startedAt > 60_000)) {
+        // We stopped waiting, but the backend may still have admitted the text.
+        // It records this message ID when it does, so ask before saying "failed".
+        const admitted = await lookupMessageMap({ apiKey: bound.apiKey, smppMessageId }).catch(() => null);
+        if (admitted?.request_id) {
+          log(`[smpp] ${bound.systemId} ${smppMessageId} admitted after slow backend; real receipt will follow`);
+          rememberMessage(admitted.request_id, { ...submitEntry, requestId: admitted.request_id });
+          return respond({ message_id: smppMessageId });
+        }
+      }
       if (!result.ok) {
         const code = String(result.error?.code || '').toLowerCase();
         const reason = `${code} ${String(result.error?.message || '').toLowerCase()}`;

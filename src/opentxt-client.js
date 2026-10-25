@@ -2,13 +2,19 @@ import { config } from './config.js';
 
 // Sends one message through the OpenTxt HTTP API.
 // Returns { ok, id, error }.
-export async function sendSms({ apiKey, to, message, idempotencyKey, strictSubmit = false }) {
+export async function sendSms({ apiKey, to, message, idempotencyKey, strictSubmit = false, receivedAt, sourceAddr, registeredDelivery, sessionId }) {
   const url = `${config.apiBaseUrl}/api-send-sms`;
   const headers = {
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
     'x-otxt-via': 'smpp',
     ...(strictSubmit ? { 'x-otxt-no-queue': '1' } : {}),
+    // The backend never admits a text after its deadline counted from here, and
+    // records this message ID itself so the receipt survives a timed-out call.
+    ...(receivedAt ? { 'x-otxt-submit-received-at': String(receivedAt) } : {}),
+    ...(sourceAddr ? { 'x-otxt-smpp-source': String(sourceAddr) } : {}),
+    ...(registeredDelivery !== undefined ? { 'x-otxt-smpp-registered': String(Number(registeredDelivery) || 0) } : {}),
+    ...(sessionId ? { 'x-otxt-smpp-session': String(sessionId) } : {}),
   };
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 

@@ -382,8 +382,9 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     if (!state) {
       return session.send(pdu.response({ command_status: smpp.ESME_RINVBNDSTS }));
     }
-    if (state.inFlight >= config.maxInFlight) {
+    if (state.inFlight >= (state.account.maxInFlight || config.maxInFlight)) {
       // Backpressure: tell the ESME to slow down instead of silently dropping.
+      noteThrottle(state);
       return session.send(pdu.response({ command_status: smpp.ESME_RTHROTTLED }));
     }
 
@@ -448,6 +449,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     // acknowledge with our message_id right away and finish in the background;
     // a late refusal is reported to the customer as a REJECTD delivery receipt.
     state.inFlight += 1;
+    noteInFlight(state);
     const smppMessageId = pdu.__otxtPartId || shortId();
     const submitEntry = {
       systemId: bound.systemId,
@@ -498,6 +500,7 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
         sessionId: submitEntry.submitSessionId,
       });
       const tookMs = Date.now() - startedAt;
+      noteAccept(state, tookMs);
       if (tookMs > 3000) log(`[smpp] ${bound.systemId} slow accept ${smppMessageId} ${tookMs}ms`);
 
       if (!result.ok && (result.error?.code === 'network_error' || Date.now() - startedAt > 60_000)) {
@@ -546,6 +549,50 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     }
   });
 });
+
+
+// ---- Throughput visibility (no secrets): exposed on /health as bind_stats ----
+const statsFor = (state) => (state.stats ||= { throttledTotal: 0, throttled: [], acceptMs: [], peak: [], acceptedTotal: 0, lastThrottleLog: 0, throttledSinceLog: 0 });
+const trim = (arr, now) => { while (arr.length && now - arr[0][0] > 60_000) arr.shift(); };
+function noteThrottle(state) {
+  const st = statsFor(state); const now = Date.now();
+  st.throttledTotal += 1; st.throttledSinceLog += 1; st.throttled.push([now, 1]); trim(st.throttled, now);
+  if (now - st.lastThrottleLog > 10_000) {
+    log(`[smpp] ${state.account.systemId} THROTTLED ${st.throttledSinceLog} submit(s) in last ${Math.round((now - (st.lastThrottleLog || now)) / 1000)}s (in-flight ${state.inFlight}/${state.account.maxInFlight || config.maxInFlight})`);
+    st.lastThrottleLog = now; st.throttledSinceLog = 0;
+  }
+}
+function noteInFlight(state) {
+  const st = statsFor(state); const now = Date.now();
+  st.peak.push([now, state.inFlight]); trim(st.peak, now);
+  if (st.peak.length > 5000) st.peak.splice(0, st.peak.length - 5000);
+}
+function noteAccept(state, ms) {
+  const st = statsFor(state); const now = Date.now();
+  st.acceptedTotal += 1; st.acceptMs.push([now, ms]); trim(st.acceptMs, now);
+  if (st.acceptMs.length > 5000) st.acceptMs.splice(0, st.acceptMs.length - 5000);
+}
+function bindStats() {
+  const now = Date.now(); const out = {};
+  for (const [id, state] of binds.entries()) {
+    const st = statsFor(state); trim(st.throttled, now); trim(st.acceptMs, now); trim(st.peak, now);
+    const ms = st.acceptMs.map((x) => x[1]).sort((a, b) => a - b);
+    const pct = (p) => (ms.length ? ms[Math.min(ms.length - 1, Math.floor(ms.length * p))] : null);
+    out[id] = {
+      tps: state.account.tps,
+      max_in_flight: state.account.maxInFlight || config.maxInFlight,
+      in_flight: state.inFlight,
+      peak_in_flight_60s: st.peak.reduce((m, x) => Math.max(m, x[1]), state.inFlight),
+      accepted_60s: ms.length,
+      accept_ms_p50_60s: pct(0.5),
+      accept_ms_p95_60s: pct(0.95),
+      throttled_60s: st.throttled.length,
+      throttled_total: st.throttledTotal,
+      accepted_total: st.acceptedTotal,
+    };
+  }
+  return out;
+}
 
 server.listen(config.smppPort, () => log(`[smpp] listening on :${config.smppPort}`));
 
@@ -656,6 +703,8 @@ const httpServer = http.createServer((req, res) => {
         durable_map_queue: [...mapQueues.values()].reduce((n, q) => n + q.rows.length, 0),
         accepted_data_codings: [0, 1, 3, 8],
         non_standard_data_coding_fallback: 'latin1',
+        max_in_flight_default: config.maxInFlight,
+        bind_stats: bindStats(),
       }),
     );
   }

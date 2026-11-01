@@ -36,6 +36,9 @@ function parseAccounts() {
       password: String(a.password),
       apiKey: String(a.api_key),
       tps: Number(a.tps || process.env.DEFAULT_TPS || 17),
+      // Optional per-account cap on submits waiting for the backend (strict binds hold each
+      // submit open for the whole backend call, so in-flight = TPS x backend latency).
+      maxInFlight: Number(a.max_in_flight) > 0 ? Number(a.max_in_flight) : null,
     });
   }
   return map;
@@ -51,7 +54,9 @@ export const config = {
   // can never 404 the DLR callbacks. Extra comma-separated tokens are ignored.
   webhookToken: required('GATEWAY_WEBHOOK_TOKEN').split(',')[0].trim(),
   accounts: parseAccounts(),
-  maxInFlight: Number(process.env.MAX_IN_FLIGHT || 200),
+  // 200 throttled strict binds at ~40 TPS once backend latency reached ~5s; 600 covers
+  // ~100 TPS at 6s. Env MAX_IN_FLIGHT still overrides.
+  maxInFlight: Number(process.env.MAX_IN_FLIGHT) > 0 ? Number(process.env.MAX_IN_FLIGHT) : 600,
   // Longest we hold a submit_sm_resp waiting on the backend before acknowledging
   // anyway (customers commonly time out at 30-60s).
   submitAckMs: Number(process.env.SUBMIT_ACK_MS || 8000),

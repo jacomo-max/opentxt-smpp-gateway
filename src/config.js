@@ -49,6 +49,10 @@ export const config = {
   httpPort: Number(process.env.PORT || 8080),
   // Base URL of the OpenTxt HTTP API (single-send endpoint lives under /api-send-sms)
   apiBaseUrl: (process.env.OPENTXT_API_BASE_URL || 'https://api.opentxt.ai').replace(/\/$/, ''),
+  // Run the backend edge function next to the database (us-west-2). Without this the
+  // edge function runs near the gateway and every one of its ~6 sequential database
+  // calls crosses regions (~190ms each). Set FUNCTION_REGION=off to disable.
+  functionRegion: (process.env.FUNCTION_REGION || 'us-west-2').trim(),
   // Shared secret the OpenTxt webhook must present to push DLRs / inbound MO into this gateway
   // Trim whitespace/newlines so a stray space pasted into the hosting dashboard
   // can never 404 the DLR callbacks. Extra comma-separated tokens are ignored.

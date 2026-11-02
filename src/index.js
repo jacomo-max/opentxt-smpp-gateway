@@ -4,7 +4,7 @@ import smpp from 'smpp';
 import { config } from './config.js';
 import { strictSubmitFor, submitFailureStatus } from './submit-policy.js';
 import { RateLimiter } from './rate-limiter.js';
-import { sendSms, storeMessageMap, lookupMessageMap } from './opentxt-client.js';
+import { sendSms, storeMessageMap, lookupMessageMap, edgeRegionStats } from './opentxt-client.js';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -705,6 +705,7 @@ const httpServer = http.createServer((req, res) => {
         non_standard_data_coding_fallback: 'latin1',
         max_in_flight_default: config.maxInFlight,
         bind_stats: bindStats(),
+        edge_region: edgeRegionStats(),
       }),
     );
   }

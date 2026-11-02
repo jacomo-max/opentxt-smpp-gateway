@@ -1,5 +1,14 @@
 import { config } from './config.js';
 
+// Supabase edge-region pinning + visibility (exposed on /health; no secrets).
+const regionHeaders = () => (config.functionRegion && config.functionRegion !== 'off' ? { 'x-region': config.functionRegion } : {});
+const edgeRegionsSeen = {};
+function noteEdgeRegion(res) {
+  const r = res?.headers?.get?.('x-sb-edge-region');
+  if (r) edgeRegionsSeen[r] = (edgeRegionsSeen[r] || 0) + 1;
+}
+export const edgeRegionStats = () => ({ pinned: config.functionRegion || null, seen: { ...edgeRegionsSeen } });
+
 // Sends one message through the OpenTxt HTTP API.
 // Returns { ok, id, error }.
 export async function sendSms({ apiKey, to, message, idempotencyKey, strictSubmit = false, receivedAt, sourceAddr, registeredDelivery, sessionId }) {
@@ -8,6 +17,7 @@ export async function sendSms({ apiKey, to, message, idempotencyKey, strictSubmi
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
     'x-otxt-via': 'smpp',
+    ...regionHeaders(),
     ...(strictSubmit ? { 'x-otxt-no-queue': '1' } : {}),
     // The backend never admits a text after its deadline counted from here, and
     // records this message ID itself so the receipt survives a timed-out call.
@@ -30,6 +40,7 @@ export async function sendSms({ apiKey, to, message, idempotencyKey, strictSubmi
         body: JSON.stringify({ to, message }),
         signal: AbortSignal.timeout(config.sendTimeoutMs),
       });
+      noteEdgeRegion(res);
       break;
     } catch (e) {
       if (attempt === 1) return { ok: false, error: { code: 'network_error', message: e.message } };
@@ -69,6 +80,7 @@ export async function storeMessageMap({ apiKey, systemId, entries }) {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        ...regionHeaders(),
       },
       body: JSON.stringify({ system_id: systemId, entries }),
     });
@@ -96,7 +108,7 @@ export async function lookupMessageMap({ apiKey, requestId, smppMessageId, suppl
 
   try {
     const res = await fetch(`${config.apiBaseUrl}/smpp-message-map?${params}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: { Authorization: `Bearer ${apiKey}`, ...regionHeaders() },
     });
     if (!res.ok) return null;
     const body = await res.json().catch(() => null);

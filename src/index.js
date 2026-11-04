@@ -330,8 +330,11 @@ function e164(raw) {
 // Hybrid queue: local refusal lists + durable send queue
 // ---------------------------------------------------------------------------
 const recipientGuard = new RecipientGuard({
-  apiBaseUrl: config.apiBaseUrl,
-  headers: config.functionRegion && config.functionRegion !== 'off' ? { 'x-region': config.functionRegion } : {},
+  apiBaseUrl: config.feedBaseUrl,
+  headers: {
+    'x-otxt-gateway-token': config.webhookToken,
+    ...(config.functionRegion && config.functionRegion !== 'off' ? { 'x-region': config.functionRegion } : {}),
+  },
   deltaMs: config.guardDeltaMs,
   staleMs: config.guardStaleMs,
   fullRefreshMs: config.guardFullRefreshMs,

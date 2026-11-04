@@ -28,6 +28,7 @@ const api = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/smpp-gateway-feed') {
     if (state.feedDown) return json(res, 500, { error: 'down' });
+    if (req.headers['x-otxt-gateway-token'] !== 'tok' || !/^Bearer otxt_/.test(req.headers.authorization || '')) return json(res, 403, { error: 'Gateway authorization required' });
     const list = url.searchParams.get('list');
     const after = url.searchParams.get('after') || '';
     const page = (arr) => { const rows = arr.filter((p) => p > after).sort().slice(0, 1).map((phone) => ({ phone })); return { rows, next_after: rows.length ? rows.at(-1).phone : null }; };
@@ -58,9 +59,9 @@ await new Promise((r) => api.listen(API_PORT, '127.0.0.1', r));
 const qdir = fs.mkdtempSync(path.join(os.tmpdir(), 'smppq-'));
 const env = {
   ...process.env,
-  SMPP_ACCOUNTS: JSON.stringify([{ system_id: 'OTXT04', password: 'testonly', api_key: 'k04' }, { system_id: 'OTXT06', password: 'testonly', api_key: 'k06' }]),
+  SMPP_ACCOUNTS: JSON.stringify([{ system_id: 'OTXT04', password: 'testonly', api_key: 'otxt_k04' }, { system_id: 'OTXT06', password: 'testonly', api_key: 'otxt_k06' }]),
   GATEWAY_WEBHOOK_TOKEN: 'tok', OPENTXT_API_BASE_URL: `http://127.0.0.1:${API_PORT}`, SMPP_PORT: String(SMPP_PORT), PORT: String(HTTP_PORT),
-  QUEUE_DIR: qdir, QUEUE_ALLOW_EPHEMERAL: '1', GUARD_DELTA_MS: '300', GUARD_STALE_MS: '1500', FUNCTION_REGION: 'off', SUBMIT_ACK_MS: '8000',
+  QUEUE_DIR: qdir, QUEUE_ALLOW_EPHEMERAL: '1', GUARD_DELTA_MS: '300', GUARD_STALE_MS: '1500', FUNCTION_REGION: 'off', FEED_BASE_URL: `http://127.0.0.1:${API_PORT}`, SUBMIT_ACK_MS: '8000',
 };
 let child, logs = '';
 async function startGateway() {

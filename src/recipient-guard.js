@@ -129,7 +129,11 @@ export class RecipientGuard {
       headers: { Authorization: `Bearer ${apiKey}`, ...this.headers },
       signal: AbortSignal.timeout(60_000),
     });
-    if (!res.ok) throw new Error(`feed ${params.list || 'delta'} HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(`feed ${params.list || 'delta'} HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     return res.json();
   }
 
@@ -187,7 +191,15 @@ export class RecipientGuard {
     if (!key || !this.cursor) return;
     // Global lists. A delta bigger than one page (e.g. a bulk daily import that
     // shares one created_at) is handled by a full reload instead of paging.
-    const body = await this.#get(key, { list: 'delta', since: this.cursor, limit: String(this.pageSize) });
+    let body;
+    try {
+      body = await this.#get(key, { list: 'delta', since: this.cursor, limit: String(this.pageSize) });
+    } catch (e) {
+      // The feed holds its window back behind long-running transactions; if our
+      // cursor is ahead of that window, step back (overlap is deduplicated).
+      if (e.status === 400) this.cursor = new Date(Date.parse(this.cursor) - 30 * 60_000).toISOString();
+      throw e;
+    }
     for (const p of body.dnc || []) this.dnc.add(toKey(p.phone ?? p));
     for (const p of body.opt_out || []) this.optOut.add(toKey(p.phone ?? p));
     if (Array.isArray(body.drop_domains)) this.dropDomains = new Set(body.drop_domains.map((d) => String(d.domain ?? d).toLowerCase()).filter(Boolean));

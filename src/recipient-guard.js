@@ -185,19 +185,22 @@ export class RecipientGuard {
   async delta() {
     const key = this.firstKey();
     if (!key || !this.cursor) return;
-    // Global lists. Loop while the endpoint reports more rows.
-    for (let i = 0; i < 50; i++) {
-      const body = await this.#get(key, { list: 'delta', since: this.cursor, limit: String(this.pageSize) });
-      for (const p of body.dnc || []) this.dnc.add(toKey(p.phone ?? p));
-      for (const p of body.opt_out || []) this.optOut.add(toKey(p.phone ?? p));
-      if (Array.isArray(body.drop_domains)) this.dropDomains = new Set(body.drop_domains.map((d) => String(d.domain ?? d).toLowerCase()).filter(Boolean));
-      const next = body.next_since ? Date.parse(body.next_since) : NaN;
-      if (Number.isFinite(next)) this.cursor = new Date(next - this.overlapMs).toISOString();
-      if (!body.more) break;
+    // Global lists. A delta bigger than one page (e.g. a bulk daily import that
+    // shares one created_at) is handled by a full reload instead of paging.
+    const body = await this.#get(key, { list: 'delta', since: this.cursor, limit: String(this.pageSize) });
+    for (const p of body.dnc || []) this.dnc.add(toKey(p.phone ?? p));
+    for (const p of body.opt_out || []) this.optOut.add(toKey(p.phone ?? p));
+    if (Array.isArray(body.drop_domains)) this.dropDomains = new Set(body.drop_domains.map((d) => String(d.domain ?? d).toLowerCase()).filter(Boolean));
+    if (body.more) {
+      this.log('[guard] large list change detected; full reload');
+      return this.fullRefresh();
     }
+    const next = body.next_since ? Date.parse(body.next_since) : NaN;
+    if (Number.isFinite(next)) this.cursor = new Date(next - this.overlapMs).toISOString();
     for (const [systemId, apiKey] of this.accounts) {
       if (!this.loadedSystems.has(systemId)) { await this.#fullSuppressions(systemId, apiKey); continue; }
       const body = await this.#get(apiKey, { list: 'suppressed_delta', since: this.supCursor.get(systemId), limit: String(this.pageSize) });
+      if (body.more) { await this.#fullSuppressions(systemId, apiKey); continue; }
       const m = this.suppressed.get(systemId);
       const now = Date.now();
       for (const r of body.rows || []) {

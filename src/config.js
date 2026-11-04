@@ -67,4 +67,19 @@ export const config = {
   // Hard cap on one backend send call; retried once with the same idempotency key.
   sendTimeoutMs: Number(process.env.SEND_TIMEOUT_MS || 90000),
   logLevel: process.env.LOG_LEVEL || 'info',
+  // Hybrid queue (accept now, send shortly) for binds listed here. Needs a
+  // durable directory (Railway volume at /data) and a fresh recipient-guard
+  // feed; otherwise those binds keep the strict wait-for-backend behaviour.
+  queuedSystems: (process.env.QUEUED_SYSTEMS ?? 'otxt04').toLowerCase().split(',').map((s) => s.trim()).filter((s) => s && s !== 'none'),
+  queueDir: process.env.QUEUE_DIR || '/data/smppgw',
+  queueAllowEphemeral: process.env.QUEUE_ALLOW_EPHEMERAL === '1',
+  queueMaxAgeMs: Number(process.env.QUEUE_MAX_AGE_MS || 30 * 60_000),
+  queueMaxPending: Number(process.env.QUEUE_MAX_PENDING || 200_000),
+  queueMaxConcurrency: Number(process.env.QUEUE_MAX_CONCURRENCY || 150),
+  // The refusal-list feed is a Supabase function reached directly (api.opentxt.ai
+  // serves the web app for GET requests).
+  feedBaseUrl: (process.env.FEED_BASE_URL || 'https://ygouapgxpzeztipvpidn.supabase.co/functions/v1').replace(/\/$/, ''),
+  guardDeltaMs: Number(process.env.GUARD_DELTA_MS || 60_000),
+  guardStaleMs: Number(process.env.GUARD_STALE_MS || 15 * 60_000),
+  guardFullRefreshMs: Number(process.env.GUARD_FULL_REFRESH_MS || 24 * 3600_000),
 };

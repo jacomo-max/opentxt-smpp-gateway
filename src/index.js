@@ -2,9 +2,12 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import smpp from 'smpp';
 import { config } from './config.js';
-import { strictSubmitFor, submitFailureStatus } from './submit-policy.js';
+import fs from 'node:fs';
+import { strictSubmitFor, submitFailureStatus, queuedSubmitFor } from './submit-policy.js';
 import { RateLimiter } from './rate-limiter.js';
 import { sendSms, storeMessageMap, lookupMessageMap, edgeRegionStats } from './opentxt-client.js';
+import { RecipientGuard, REFUSAL } from './recipient-guard.js';
+import { SubmitQueue } from './submit-queue.js';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -324,6 +327,134 @@ function e164(raw) {
 }
 
 // ---------------------------------------------------------------------------
+// Hybrid queue: local refusal lists + durable send queue
+// ---------------------------------------------------------------------------
+const recipientGuard = new RecipientGuard({
+  apiBaseUrl: config.apiBaseUrl,
+  headers: config.functionRegion && config.functionRegion !== 'off' ? { 'x-region': config.functionRegion } : {},
+  deltaMs: config.guardDeltaMs,
+  staleMs: config.guardStaleMs,
+  fullRefreshMs: config.guardFullRefreshMs,
+  log,
+});
+for (const account of config.accounts.values()) {
+  if (queuedSubmitFor(account.systemId, config.queuedSystems)) recipientGuard.addAccount(account.systemId, account.apiKey);
+}
+
+// A queue that would not survive a redeploy must never acknowledge texts.
+function durableQueueDir() {
+  if (config.queuedSystems.length === 0) return null;
+  try {
+    const root = config.queueDir.startsWith('/data') ? '/data' : config.queueDir;
+    if (!config.queueAllowEphemeral && !fs.existsSync(root)) {
+      log(`[queue] ${root} not mounted (add a Railway volume at /data); queued mode disabled, strict behaviour kept`);
+      return null;
+    }
+    fs.mkdirSync(config.queueDir, { recursive: true });
+    fs.accessSync(config.queueDir, fs.constants.W_OK);
+    return config.queueDir;
+  } catch (e) {
+    log(`[queue] ${config.queueDir} not writable (${e?.message || e}); queued mode disabled`);
+    return null;
+  }
+}
+
+const QUEUE_DIR = durableQueueDir();
+const submitQueue = QUEUE_DIR
+  ? new SubmitQueue({ dir: QUEUE_DIR, handler: deliverQueued, log, maxConcurrency: config.queueMaxConcurrency, maxPending: config.queueMaxPending })
+  : null;
+
+function queuedReady(systemId) {
+  return Boolean(
+    submitQueue &&
+      queuedSubmitFor(systemId, config.queuedSystems) &&
+      recipientGuard.ready(systemId) &&
+      submitQueue.canAccept(),
+  );
+}
+
+const localRefusals = {}; // systemId -> { dnc, opted_out, suppressed, link_dropped }
+function noteLocalRefusal(state, kind) {
+  const r = (localRefusals[state.account.systemId] ||= { dnc: 0, opted_out: 0, suppressed: 0, link_dropped: 0 });
+  r[kind] += 1;
+}
+
+const retryDelay = (attempts) => Math.min(30_000, 1000 * 2 ** Math.min(attempts, 5));
+
+async function deliverQueued(item) {
+  const account = config.accounts.get(item.systemId);
+  const entry = {
+    systemId: item.systemId,
+    smppMessageId: item.id,
+    extraSmppIds: item.extraSmppIds || [],
+    to: item.to,
+    registeredDelivery: item.registeredDelivery,
+    sourceAddr: item.sourceAddr,
+    apiKey: account?.apiKey,
+    session: null,
+    submitSessionId: item.submitSessionId,
+  };
+  const age = Date.now() - item.receivedAt;
+  // A final outcome already decided; only the REJECTD receipt is still owed.
+  if (item.final) return closeWithReceipt(item, entry, age);
+  if (!account) {
+    item.final = 'account removed';
+    return closeWithReceipt(item, entry, age);
+  }
+  if (age > config.queueMaxAgeMs) {
+    item.final = `not sent within ${Math.round(config.queueMaxAgeMs / 60000)} min`;
+    return closeWithReceipt(item, entry, age);
+  }
+  const t0 = Date.now();
+  const result = await sendSms({
+    apiKey: account.apiKey,
+    strictSubmit: false,
+    to: item.to,
+    message: item.message,
+    idempotencyKey: `smpp_${item.systemId}_${item.id}`,
+    // The backend's response window starts when we hand it the text, not when
+    // the customer submitted it (the queue wait is ours, not the backend's).
+    receivedAt: t0,
+    sourceAddr: item.sourceAddr,
+    registeredDelivery: item.registeredDelivery,
+    sessionId: item.submitSessionId,
+  });
+  if (result.ok) {
+    rememberMessage(result.id, {
+      ...entry,
+      supplierMessageId: result.raw?.supplier_message_id || result.raw?.data?.supplier_message_id || null,
+      requestId: result.id,
+    });
+    return {};
+  }
+  const status = Number(result.status || 0);
+  const retryable = result.error?.code === 'network_error' || status >= 500 || status === 429 || status === 402 || status === 408;
+  if (retryable) {
+    // The backend may have admitted it before we stopped waiting.
+    const admitted = await lookupMessageMap({ apiKey: account.apiKey, smppMessageId: item.id }).catch(() => null);
+    if (admitted?.request_id) {
+      rememberMessage(admitted.request_id, { ...entry, requestId: admitted.request_id });
+      return {};
+    }
+    return { retryInMs: retryDelay(item.attempts) };
+  }
+  item.final = `${result.error?.code || status} ${result.error?.message || ''}`.trim();
+  return closeWithReceipt(item, entry, age);
+}
+
+async function closeWithReceipt(item, entry, age) {
+  if (!item.finalLogged) {
+    log(`[queue] ${item.systemId} ${item.id} not sent: ${item.final}; REJECTD receipt`);
+    item.finalLogged = true;
+  }
+  if (!(item.registeredDelivery & 1)) return {};
+  const ok = await sendDeliveryReceipt(entry, 'REJECTD', '001').catch(() => false);
+  // Customer disconnected: keep trying to hand over the receipt for up to an hour.
+  if (!ok && age < config.queueMaxAgeMs + 3600_000) return { retryInMs: 15_000 };
+  return {};
+}
+
+// ---------------------------------------------------------------------------
 // SMPP server
 // ---------------------------------------------------------------------------
 const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (session) => {
@@ -382,12 +513,6 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
     if (!state) {
       return session.send(pdu.response({ command_status: smpp.ESME_RINVBNDSTS }));
     }
-    if (state.inFlight >= (state.account.maxInFlight || config.maxInFlight)) {
-      // Backpressure: tell the ESME to slow down instead of silently dropping.
-      noteThrottle(state);
-      return session.send(pdu.response({ command_status: smpp.ESME_RTHROTTLED }));
-    }
-
     const to = e164(pdu.destination_addr);
     const message = decodeShortMessage(pdu).trim();
     const dataCoding = Number(pdu.data_coding || 0);
@@ -407,9 +532,27 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       );
     }
 
+    // Hybrid queue: refuse do-not-contact / STOP / spam-paused recipients (and
+    // carrier-dropped links) instantly from the local lists, accept everything
+    // else instantly and send it from the durable queue. Falls back to the
+    // normal path below whenever the lists are stale or the queue is full.
+    const queuedMode = queuedReady(bound.systemId);
+    if (queuedMode) {
+      const part0 = concatInfo(pdu, shortMessageBuffer(pdu));
+      const hit = recipientGuard.check(bound.systemId, to, part0 && part0.total > 1 ? '' : message);
+      if (hit) {
+        noteLocalRefusal(state, hit);
+        return session.send(pdu.response({ command_status: REFUSAL[hit].status }));
+      }
+    } else if (state.inFlight >= (state.account.maxInFlight || config.maxInFlight)) {
+      // Backpressure: tell the ESME to slow down instead of silently dropping.
+      noteThrottle(state);
+      return session.send(pdu.response({ command_status: smpp.ESME_RTHROTTLED }));
+    }
+
     // Long texts arrive as several submit_sm parts. Join them and send ONE
     // text, otherwise the handset gets each part as a separate message.
-    const strictSubmit = strictSubmitFor(bound.systemId);
+    const strictSubmit = !queuedMode && strictSubmitFor(bound.systemId);
     let pendingPartResponses = [];
     let extraSmppIds = [];
     let finalMessage = message;
@@ -428,12 +571,12 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       group.registeredDelivery |= Number(pdu.registered_delivery || 0);
       const partId = shortId();
       group.ids.push(partId);
-      if (strictSubmit) group.pendingResponses.push({ session, pdu, partId });
+      if (group.pendingResponses) group.pendingResponses.push({ session, pdu, partId });
       if (group.parts.size < part.total) {
-        if (strictSubmit) return;
+        if (group.pendingResponses) return;
         return session.send(pdu.response({ message_id: partId }));
       }
-      if (strictSubmit) pendingPartResponses = group.pendingResponses;
+      if (group.pendingResponses) pendingPartResponses = group.pendingResponses;
       clearTimeout(group.timer);
       partGroups.delete(key);
       finalMessage = [...group.parts.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t).join('').trim();
@@ -441,6 +584,35 @@ const server = smpp.createServer({ debug: config.logLevel === 'debug' }, (sessio
       pdu.__otxtPartId = partId;
       pdu.__otxtRegistered = group.registeredDelivery;
       log(`[smpp] ${bound.systemId} joined ${part.total}-part text ref=${part.ref}`);
+    }
+
+    if (queuedMode) {
+      const smppMessageId = pdu.__otxtPartId || shortId();
+      try {
+        submitQueue.enqueue({
+          id: smppMessageId,
+          systemId: bound.systemId,
+          to,
+          message: finalMessage,
+          extraSmppIds,
+          sourceAddr: String(pdu.source_addr || ''),
+          registeredDelivery: Number(pdu.__otxtRegistered ?? pdu.registered_delivery ?? 0),
+          submitSessionId: session.otxtSessionId,
+          receivedAt: Date.now(),
+        });
+      } catch (e) {
+        // Could not write the journal: never acknowledge a text we might lose.
+        log(`[queue] journal write failed for ${bound.systemId}: ${e?.message || e}`);
+        return session.send(pdu.response({ command_status: smpp.ESME_RSYSERR }));
+      }
+      noteAccept(state, 0);
+      if (pendingPartResponses.length) {
+        for (const item of pendingPartResponses) {
+          try { item.session.send(item.pdu.response({ message_id: item.partId })); } catch {}
+        }
+        return;
+      }
+      return session.send(pdu.response({ message_id: smppMessageId }));
     }
 
     // Fast acknowledgement: never make the customer wait on our backend.
@@ -706,6 +878,14 @@ const httpServer = http.createServer((req, res) => {
         max_in_flight_default: config.maxInFlight,
         bind_stats: bindStats(),
         edge_region: edgeRegionStats(),
+        hybrid_queue: {
+          systems: config.queuedSystems,
+          durable_dir: QUEUE_DIR,
+          active_for: config.queuedSystems.filter((s) => [...binds.keys()].some((b) => b.toLowerCase() === s && queuedReady(b))),
+          recipient_guard: recipientGuard.stats(),
+          local_refusals: localRefusals,
+          queue: submitQueue ? submitQueue.stats() : null,
+        },
       }),
     );
   }
@@ -768,14 +948,25 @@ const httpServer = http.createServer((req, res) => {
 
 httpServer.listen(config.httpPort, () => log(`[http] listening on :${config.httpPort}`));
 
+if (submitQueue) {
+  submitQueue.open();
+  recipientGuard.start();
+  log(`[queue] hybrid mode armed for ${config.queuedSystems.join(', ')} (journal ${QUEUE_DIR}); active once the refusal lists load`);
+}
+
 process.on('SIGTERM', async () => {
   log('shutting down: draining in-flight submits');
   // Stop taking new binds, let every submit already accepted finish (and get
   // its submit_sm_resp), persist the map, then exit. Capped at 25s.
   server.close();
+  recipientGuard.stop();
+  // Queued texts not yet started stay in the journal on the volume and are
+  // replayed by the next process; let calls already running finish.
+  if (submitQueue) submitQueue.paused = true;
   const deadline = Date.now() + 25_000;
-  const inFlight = () => [...binds.values()].reduce((n, b) => n + (b.inFlight || 0), 0);
+  const inFlight = () => [...binds.values()].reduce((n, b) => n + (b.inFlight || 0), 0) + (submitQueue ? submitQueue.activeCount() : 0);
   while (inFlight() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  submitQueue?.close();
   for (const systemId of mapQueues.keys()) await flushDurableMap(systemId);
   log(`drained (in-flight left: ${inFlight()}), exiting`);
   httpServer.close(() => process.exit(0));

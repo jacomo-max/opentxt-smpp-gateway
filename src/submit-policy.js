@@ -1,6 +1,8 @@
 // Mirrored into the separate gateway repository; contains no credentials.
 const strictSystems = new Set(['mmdsmart', 'otxt01', 'otxt04', 'otxt05', 'otxt17']);
 export const strictSubmitFor = systemId => strictSystems.has(String(systemId).toLowerCase());
+// Binds in hybrid mode: instant answer after the local refusal check, send from a durable queue.
+export const queuedSubmitFor = (systemId, list) => list.includes(String(systemId).toLowerCase());
 export function submitFailureStatus(result) {
   const status = result.error?.smpp?.command_status;
   if (Number.isInteger(status) && status > 0 && status <= 0xffffffff) return status;

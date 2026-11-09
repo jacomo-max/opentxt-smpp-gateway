@@ -39,4 +39,23 @@ export const errField = (code) => code.toString(16).toUpperCase().padStart(3, '0
 /** network_error_code TLV: network type 3 (GSM) + 2-byte error code. */
 export const networkErrorTlv = (code) => Buffer.from([0x03, (code >> 8) & 0xff, code & 0xff]);
 
+// SMPP_REJECT_STAT "otxt01:UNDELIV": binds whose billing reads uncharged refusals as
+//   "Failed" get stat:UNDELIV (message_state 5) instead of stat:REJECTD, keeping the
+//   agreed code (err:045 + network_error_code). Lexico asked for this Nov 9 2026.
+const parseStat = (raw) => {
+  const out = new Map();
+  for (const part of String(raw || '').split(',')) {
+    const [sys, st] = part.split(':').map((x) => x && x.trim());
+    if (sys && /^(UNDELIV|REJECTD)$/i.test(st || '')) out.set(sys.toLowerCase(), st.toUpperCase());
+  }
+  return out;
+};
+const rejectStats = parseStat(process.env.SMPP_REJECT_STAT ?? 'otxt01:UNDELIV');
+
+/** Receipt stat for an uncharged refusal on this bind (default REJECTD). */
+export function rejectStatFor(systemId, map = rejectStats) {
+  return map.get(String(systemId || '').toLowerCase()) ?? 'REJECTD';
+}
+
 export const _parse = parse;
+export const _parseStat = parseStat;

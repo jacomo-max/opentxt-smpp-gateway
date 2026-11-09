@@ -1,4 +1,4 @@
-import { refusalStatusFor, rejectCodeFor, errField, networkErrorTlv } from './receipt-codes.js';
+import { refusalStatusFor, rejectCodeFor, rejectStatFor, errField, networkErrorTlv } from './receipt-codes.js';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import smpp from 'smpp';
@@ -790,6 +790,8 @@ async function sendOneReceipt(entry, stateText, statusCode) {
   // Uncharged refusals on binds with an agreed code: err:XXX (hex) + network_error_code TLV.
   const rejectCode = stateText === 'REJECTD' ? rejectCodeFor(entry.systemId) : null;
   if (rejectCode) statusCode = errField(rejectCode);
+  // Binds that read uncharged refusals as "Failed" get stat:UNDELIV with the same code.
+  if (rejectCode) stateText = rejectStatFor(entry.systemId);
   const target = pickReceiveSession(entry.systemId, entry.session, entry.submitSessionId);
   if (!target) {
     log(`[webhook] no receive-capable session bound for ${entry.systemId}`);
@@ -821,7 +823,7 @@ async function sendOneReceipt(entry, stateText, statusCode) {
           esm_class: 4, // delivery receipt
           short_message: text,
           receipted_message_id: entry.smppMessageId,
-          message_state: stateText === 'DELIVRD' ? 2 : (rejectCode ? 8 : 5),
+          message_state: stateText === 'DELIVRD' ? 2 : (stateText === 'REJECTD' ? 8 : 5),
           ...(rejectCode ? { network_error_code: networkErrorTlv(rejectCode) } : {}),
         },
         (pdu) => finish(Number(pdu?.command_status ?? -1) === 0),

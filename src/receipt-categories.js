@@ -6,7 +6,7 @@ export function receiptFieldsFor(systemId, stateText, statusCode) {
     return { stateText, statusCode, networkError: null };
   }
   if (stateText === 'REJECTD') {
-    return { stateText: 'UNDELIV', statusCode: '8191', networkError: Buffer.from([3, 31, 255]) };
+    return { stateText: 'REJECTD', statusCode: '8191', networkError: Buffer.from([3, 31, 255]) };
   }
   if (stateText === 'UNDELIV') {
     return { stateText, statusCode: '000', networkError: Buffer.from([3, 0, 0]) };
